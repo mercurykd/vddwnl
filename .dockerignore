@@ -1,0 +1,11 @@
+.git
+.gitignore
+bot
+bot.exe
+data
+.env
+cookies.txt
+*.log
+README.md
+Dockerfile
+docker-compose.yml

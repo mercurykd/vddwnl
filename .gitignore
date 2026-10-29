@@ -1,0 +1,12 @@
+# Бот и его временные файлы
+/bot
+/bot.exe
+/data/
+*.log
+
+# Секреты
+.env
+cookies.txt
+
+# Go
+/vendor/

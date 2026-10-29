@@ -1,0 +1,35 @@
+name: tg-video-bot
+
+services:
+  bot:
+    build:
+      context: .
+    image: tg-video-bot:latest
+    container_name: tg-video-bot
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    env_file:
+      - .env
+    environment:
+      # WORK_DIR в .env игнорируется: внутри контейнера всегда /data.
+      WORK_DIR: /data
+      TZ: ${TZ:-UTC}
+    volumes:
+      - bot-data:/data
+      # cookies.txt с хоста (YouTube/Instagram/X). :ro безопасен —
+      # бот копирует файл в рабочий каталог перед каждой загрузкой.
+      - ./cookies.txt:/data/cookies.txt:ro
+    # Локальный Bot API на хосте (для файлов >50 МБ): раскомментируйте.
+    # extra_hosts:
+    #   - "host.docker.internal:host-gateway"
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  bot-data:
