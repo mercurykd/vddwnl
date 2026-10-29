@@ -40,11 +40,13 @@ type Update struct {
 }
 
 type Message struct {
-	MessageID int64  `json:"message_id"`
-	Chat      Chat   `json:"chat"`
-	From      *User  `json:"from"`
-	Text      string `json:"text"`
-	Caption   string `json:"caption"`
+	MessageID       int64  `json:"message_id"`
+	MessageThreadID int64  `json:"message_thread_id"`
+	Chat            Chat   `json:"chat"`
+	From            *User  `json:"from"`
+	SenderChat      *Chat  `json:"sender_chat"`
+	Text            string `json:"text"`
+	Caption         string `json:"caption"`
 }
 
 type Chat struct {
@@ -107,11 +109,14 @@ func (c *Client) GetUpdates(ctx context.Context, offset int64, timeoutSec int) (
 	return updates, nil
 }
 
-func (c *Client) SendMessage(ctx context.Context, chatID int64, text string, replyTo int64) (*Message, error) {
+func (c *Client) SendMessage(ctx context.Context, chatID, threadID int64, text string, replyTo int64) (*Message, error) {
 	payload := map[string]any{
 		"chat_id":    chatID,
 		"text":       truncate(text, 4096),
 		"parse_mode": "HTML",
+	}
+	if threadID != 0 {
+		payload["message_thread_id"] = threadID
 	}
 	if replyTo != 0 {
 		payload["reply_to_message_id"] = replyTo
@@ -136,6 +141,7 @@ func (c *Client) EditMessageText(ctx context.Context, chatID, messageID int64, t
 
 type Video struct {
 	ChatID      int64
+	ThreadID    int64
 	ReplyTo     int64
 	Path        string
 	Caption     string
@@ -151,6 +157,9 @@ func (c *Client) SendVideo(ctx context.Context, v Video) (*Message, error) {
 		"caption":            truncate(v.Caption, 1024),
 		"parse_mode":         "HTML",
 		"supports_streaming": "true",
+	}
+	if v.ThreadID != 0 {
+		fields["message_thread_id"] = strconv.FormatInt(v.ThreadID, 10)
 	}
 	if v.ReplyTo != 0 {
 		fields["reply_to_message_id"] = strconv.FormatInt(v.ReplyTo, 10)
@@ -172,6 +181,7 @@ func (c *Client) SendVideo(ctx context.Context, v Video) (*Message, error) {
 
 type Document struct {
 	ChatID      int64
+	ThreadID    int64
 	ReplyTo     int64
 	Path        string
 	Caption     string
@@ -183,6 +193,9 @@ func (c *Client) SendDocument(ctx context.Context, d Document) (*Message, error)
 		"chat_id":    strconv.FormatInt(d.ChatID, 10),
 		"caption":    truncate(d.Caption, 1024),
 		"parse_mode": "HTML",
+	}
+	if d.ThreadID != 0 {
+		fields["message_thread_id"] = strconv.FormatInt(d.ThreadID, 10)
 	}
 	if d.ReplyTo != 0 {
 		fields["reply_to_message_id"] = strconv.FormatInt(d.ReplyTo, 10)

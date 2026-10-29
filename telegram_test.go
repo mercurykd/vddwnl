@@ -27,7 +27,7 @@ func TestSendMessage(t *testing.T) {
 	defer srv.Close()
 
 	client := NewClient("TOKEN", srv.URL)
-	msg, err := client.SendMessage(context.Background(), 1, "привет", 0)
+	msg, err := client.SendMessage(context.Background(), 1, 55, "привет", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,6 +43,9 @@ func TestSendMessage(t *testing.T) {
 	if payload["chat_id"] != float64(1) {
 		t.Errorf("chat_id=%v", payload["chat_id"])
 	}
+	if payload["message_thread_id"] != float64(55) {
+		t.Errorf("message_thread_id=%v", payload["message_thread_id"])
+	}
 }
 
 func TestUploadVideo(t *testing.T) {
@@ -52,7 +55,7 @@ func TestUploadVideo(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var gotChatID, gotCaption, gotFile string
+	var gotChatID, gotCaption, gotFile, gotThread string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/form-data") {
 			t.Errorf("ожидался multipart, получен %q", r.Header.Get("Content-Type"))
@@ -63,6 +66,7 @@ func TestUploadVideo(t *testing.T) {
 		}
 		gotChatID = r.FormValue("chat_id")
 		gotCaption = r.FormValue("caption")
+		gotThread = r.FormValue("message_thread_id")
 		f, _, err := r.FormFile("video")
 		if err != nil {
 			t.Errorf("нет файла: %v", err)
@@ -78,15 +82,15 @@ func TestUploadVideo(t *testing.T) {
 	defer srv.Close()
 
 	client := NewClient("TOKEN", srv.URL)
-	msg, err := client.SendVideo(context.Background(), Video{ChatID: 5, Path: path, Caption: "тест", Width: 640, Height: 360, Duration: 3})
+	msg, err := client.SendVideo(context.Background(), Video{ChatID: 5, ThreadID: 77, Path: path, Caption: "тест", Width: 640, Height: 360, Duration: 3})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if msg.MessageID != 9 {
 		t.Errorf("message_id=%d", msg.MessageID)
 	}
-	if gotChatID != "5" || gotCaption != "тест" {
-		t.Errorf("chat_id=%q caption=%q", gotChatID, gotCaption)
+	if gotChatID != "5" || gotCaption != "тест" || gotThread != "77" {
+		t.Errorf("chat_id=%q caption=%q thread=%q", gotChatID, gotCaption, gotThread)
 	}
 	if gotFile != content {
 		t.Errorf("файл повреждён: %d байт вместо %d", len(gotFile), len(content))

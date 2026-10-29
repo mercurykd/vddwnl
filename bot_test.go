@@ -1,6 +1,10 @@
 package main
 
 import (
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -188,7 +192,6 @@ func TestUnauthorizedIsSilent(t *testing.T) {
 		"привет",
 		"/start",
 		"/help",
-		"/id",
 		"/v https://youtu.be/dQw4w9WgXcQ",
 		"/unknown",
 	} {
@@ -220,6 +223,108 @@ func TestGroupIgnoresPlainLinks(t *testing.T) {
 	}
 }
 
+func TestAnonymousAdminEnqueues(t *testing.T) {
+	b := &Bot{cfg: &Config{}, jobs: make(chan job, 2), userLocks: newUserLocks()}
+	b.handle(anonymousMessage("/v https://youtu.be/dQw4w9WgXcQ"))
+
+	select {
+	case j := <-b.jobs:
+		if j.threadID != 77 {
+			t.Errorf("threadID=%d, ожидался 77", j.threadID)
+		}
+		if j.userID != -100200 {
+			t.Errorf("userID=%d, ожидался ID группы", j.userID)
+		}
+		if len(j.urls) != 1 || j.urls[0] != "https://youtu.be/dQw4w9WgXcQ" {
+			t.Errorf("urls=%v", j.urls)
+		}
+	default:
+		t.Fatal("анонимный админ должен ставить задачу в очередь")
+	}
+}
+
+func TestAnonymousAdminAllowlist(t *testing.T) {
+	msg := anonymousMessage("/v https://youtu.be/dQw4w9WgXcQ")
+
+	denied := &Bot{
+		cfg:       &Config{AllowedUsers: map[int64]bool{7: true}},
+		jobs:      make(chan job, 1),
+		userLocks: newUserLocks(),
+	}
+	denied.handle(msg)
+	if len(denied.jobs) != 0 {
+		t.Error("анонимный админ не из списка не должен ставить задачу")
+	}
+
+	allowed := &Bot{
+		cfg:       &Config{AllowedUsers: map[int64]bool{-100200: true}},
+		jobs:      make(chan job, 1),
+		userLocks: newUserLocks(),
+	}
+	allowed.handle(msg)
+	if len(allowed.jobs) != 1 {
+		t.Error("ID группы в ALLOWED_USERS должен разрешать анонимного админа")
+	}
+}
+
+func TestBotMessageIgnored(t *testing.T) {
+	b := &Bot{cfg: &Config{}, jobs: make(chan job, 1), userLocks: newUserLocks()}
+	b.handle(&Message{
+		Chat: Chat{ID: -100200, Type: "supergroup"},
+		From: &User{ID: 123, IsBot: true},
+		Text: "/v https://youtu.be/dQw4w9WgXcQ",
+	})
+	if len(b.jobs) != 0 {
+		t.Error("сообщения от обычных ботов нужно игнорировать")
+	}
+}
+
+func anonymousMessage(text string) *Message {
+	return &Message{
+		MessageID:       5,
+		MessageThreadID: 77,
+		Chat:            Chat{ID: -100200, Type: "supergroup"},
+		From:            &User{ID: 1087968824, IsBot: true, FirstName: "GroupAnonymousBot"},
+		SenderChat:      &Chat{ID: -100200, Type: "supergroup"},
+		Text:            text,
+	}
+}
+
+func TestIDAlwaysAvailable(t *testing.T) {
+	var payload map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("не разобрал JSON: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"ok":true,"result":{"message_id":1}}`)
+	}))
+	defer srv.Close()
+
+	b := &Bot{
+		cfg: &Config{AllowedUsers: map[int64]bool{7: true}},
+		tg:  NewClient("TOKEN", srv.URL),
+	}
+	b.handle(&Message{
+		MessageID:       1,
+		MessageThreadID: 55,
+		Chat:            Chat{ID: -100200, Type: "supergroup"},
+		From:            &User{ID: 42},
+		Text:            "/id@test_bot",
+	})
+
+	if payload == nil {
+		t.Fatal("/id должен отвечать даже при закрытом доступе")
+	}
+	if payload["message_thread_id"] != float64(55) {
+		t.Errorf("message_thread_id=%v", payload["message_thread_id"])
+	}
+	text, _ := payload["text"].(string)
+	if !strings.Contains(text, "<code>42</code>") {
+		t.Errorf("в ответе нет ID отправителя: %q", text)
+	}
+}
+
 func TestCommandArg(t *testing.T) {
 	tests := map[string]string{
 		"/v https://youtu.be/dQw4w9WgXcQ":           "https://youtu.be/dQw4w9WgXcQ",
@@ -236,5 +341,18 @@ func TestCommandArg(t *testing.T) {
 	}
 	if !isGroupChat("group") || !isGroupChat("supergroup") || isGroupChat("private") {
 		t.Error("isGroupChat определяет тип чата неверно")
+	}
+
+	commands := map[string]string{
+		"/v@test_bot https://youtu.be/x": "/v",
+		"/ID":                            "/id",
+		"/id@test_bot":                   "/id",
+		"просто текст":                   "",
+		"":                               "",
+	}
+	for in, want := range commands {
+		if got := commandName(in); got != want {
+			t.Errorf("commandName(%q)=%q, ожидалось %q", in, got, want)
+		}
 	}
 }

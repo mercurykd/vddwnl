@@ -29,6 +29,7 @@ type Bot struct {
 
 type job struct {
 	chatID    int64
+	threadID  int64
 	userID    int64
 	messageID int64
 	urls      []string
@@ -122,8 +123,10 @@ func (b *Bot) worker(ctx context.Context) {
 }
 
 func (b *Bot) handle(msg *Message) {
-	from := msg.From
-	if from == nil || from.IsBot {
+	// Анонимный админ приходит от служебного GroupAnonymousBot (или без from),
+	// но с sender_chat, совпадающим с чатом.
+	anonymous := isAnonymousAdmin(msg)
+	if !anonymous && (msg.From == nil || msg.From.IsBot) {
 		return
 	}
 
@@ -132,12 +135,16 @@ func (b *Bot) handle(msg *Message) {
 		return
 	}
 
-	if !b.allowed(from.ID) {
+	if strings.HasPrefix(text, "/") {
+		// /id доступен всем и всегда, остальные команды — только своим.
+		if commandName(text) != "/id" && !b.allowed(senderID(msg)) {
+			return
+		}
+		b.handleCommand(msg, text)
 		return
 	}
 
-	if strings.HasPrefix(text, "/") {
-		b.handleCommand(msg, text)
+	if !b.allowed(senderID(msg)) {
 		return
 	}
 
@@ -153,7 +160,7 @@ func (b *Bot) handle(msg *Message) {
 func (b *Bot) handleURLs(msg *Message, text string) {
 	urls := extractURLs(text)
 	if len(urls) == 0 {
-		b.notify(msg.Chat.ID, "Пришлите ссылку на видео — скачаю и отправлю файлом.\n\nНапример: <code>https://youtu.be/dQw4w9WgXcQ</code>", msg.MessageID)
+		b.notify(msg.Chat.ID, msg.MessageThreadID, "Пришлите ссылку на видео — скачаю и отправлю файлом.\n\nНапример: <code>https://youtu.be/dQw4w9WgXcQ</code>", msg.MessageID)
 		return
 	}
 	b.enqueue(msg, urls)
@@ -162,52 +169,80 @@ func (b *Bot) handleURLs(msg *Message, text string) {
 func (b *Bot) enqueue(msg *Message, urls []string) {
 	if len(urls) > maxURLsPerMessage {
 		urls = urls[:maxURLsPerMessage]
-		b.notify(msg.Chat.ID, fmt.Sprintf("В сообщении больше %d ссылок — обработаю первые %d.", maxURLsPerMessage, maxURLsPerMessage), msg.MessageID)
+		b.notify(msg.Chat.ID, msg.MessageThreadID, fmt.Sprintf("В сообщении больше %d ссылок — обработаю первые %d.", maxURLsPerMessage, maxURLsPerMessage), msg.MessageID)
 	}
 
-	from := msg.From
-	if !b.userLocks.tryLock(from.ID) {
-		b.notify(msg.Chat.ID, "⏳ У вас уже есть активная загрузка. Дождитесь её окончания.", msg.MessageID)
+	uid := senderID(msg)
+	if !b.userLocks.tryLock(uid) {
+		b.notify(msg.Chat.ID, msg.MessageThreadID, "⏳ У вас уже есть активная загрузка. Дождитесь её окончания.", msg.MessageID)
 		return
 	}
 
 	select {
-	case b.jobs <- job{chatID: msg.Chat.ID, userID: from.ID, messageID: msg.MessageID, urls: urls}:
+	case b.jobs <- job{chatID: msg.Chat.ID, threadID: msg.MessageThreadID, userID: uid, messageID: msg.MessageID, urls: urls}:
 	default:
-		b.userLocks.unlock(from.ID)
-		b.notify(msg.Chat.ID, "🚦 Очередь переполнена, попробуйте через пару минут.", msg.MessageID)
+		b.userLocks.unlock(uid)
+		b.notify(msg.Chat.ID, msg.MessageThreadID, "🚦 Очередь переполнена, попробуйте через пару минут.", msg.MessageID)
 	}
 }
 
 func (b *Bot) handleCommand(msg *Message, text string) {
-	cmd := strings.ToLower(strings.Fields(text)[0])
-	if i := strings.IndexByte(cmd, '@'); i > 0 {
-		cmd = cmd[:i]
-	}
+	cmd := commandName(text)
 
 	switch cmd {
 	case "/start", "/help":
-		b.notify(msg.Chat.ID, helpText, msg.MessageID)
+		b.notify(msg.Chat.ID, msg.MessageThreadID, helpText, msg.MessageID)
 	case "/id":
-		id := int64(0)
-		if msg.From != nil {
-			id = msg.From.ID
-		}
-		b.notify(msg.Chat.ID, fmt.Sprintf("Ваш Telegram ID: <code>%d</code>", id), msg.MessageID)
+		b.replyID(msg)
 	case "/v":
 		urls := extractURLs(commandArg(text))
 		if len(urls) == 0 {
-			b.notify(msg.Chat.ID, "Пришлите ссылку после команды: <code>/v https://youtu.be/...</code>", msg.MessageID)
+			b.notify(msg.Chat.ID, msg.MessageThreadID, "Пришлите ссылку после команды: <code>/v https://youtu.be/...</code>", msg.MessageID)
 			return
 		}
 		b.enqueue(msg, urls)
 	default:
-		b.notify(msg.Chat.ID, "Неизвестная команда. Наберите /help.", msg.MessageID)
+		b.notify(msg.Chat.ID, msg.MessageThreadID, "Неизвестная команда. Наберите /help.", msg.MessageID)
 	}
 }
 
 func isGroupChat(chatType string) bool {
 	return chatType == "group" || chatType == "supergroup"
+}
+
+// commandName возвращает команду в нижнем регистре без упоминания бота.
+func commandName(text string) string {
+	fields := strings.Fields(text)
+	if len(fields) == 0 || !strings.HasPrefix(fields[0], "/") {
+		return ""
+	}
+	cmd := strings.ToLower(fields[0])
+	if i := strings.IndexByte(cmd, '@'); i > 0 {
+		cmd = cmd[:i]
+	}
+	return cmd
+}
+
+// replyID показывает ID отправителя; работает независимо от ALLOWED_USERS.
+func (b *Bot) replyID(msg *Message) {
+	label := "Ваш Telegram ID"
+	if isAnonymousAdmin(msg) {
+		label = "ID группы (анонимный админ)"
+	}
+	b.notify(msg.Chat.ID, msg.MessageThreadID, fmt.Sprintf("%s: <code>%d</code>", label, senderID(msg)), msg.MessageID)
+}
+
+// isAnonymousAdmin — сообщение отправлено от имени группы (анонимный админ).
+func isAnonymousAdmin(msg *Message) bool {
+	return isGroupChat(msg.Chat.Type) && msg.SenderChat != nil && msg.SenderChat.ID == msg.Chat.ID
+}
+
+// senderID возвращает ID пользователя, а для анонимного админа — ID группы.
+func senderID(msg *Message) int64 {
+	if isAnonymousAdmin(msg) {
+		return msg.SenderChat.ID
+	}
+	return msg.From.ID
 }
 
 // commandArg возвращает текст после первого слова команды.
@@ -248,7 +283,7 @@ func (b *Bot) processOne(j job, rawURL string) {
 	ctx, cancel := context.WithTimeout(context.Background(), b.cfg.JobTimeout)
 	defer cancel()
 
-	status, err := b.tg.SendMessage(ctx, j.chatID, "⏳ Скачиваю видео…", j.messageID)
+	status, err := b.tg.SendMessage(ctx, j.chatID, j.threadID, "⏳ Скачиваю видео…", j.messageID)
 	if err != nil {
 		log.Printf("не удалось отправить статус: %v", err)
 		return
@@ -293,6 +328,7 @@ func (b *Bot) processOne(j job, rawURL string) {
 
 	_, err = b.tg.SendVideo(ctx, Video{
 		ChatID:      j.chatID,
+		ThreadID:    j.threadID,
 		ReplyTo:     j.messageID,
 		Path:        res.Path,
 		Caption:     caption,
@@ -306,6 +342,7 @@ func (b *Bot) processOne(j job, rawURL string) {
 		sendCtx, sendCancel := context.WithTimeout(context.Background(), 15*time.Minute)
 		_, docErr := b.tg.SendDocument(sendCtx, Document{
 			ChatID:      j.chatID,
+			ThreadID:    j.threadID,
 			ReplyTo:     j.messageID,
 			Path:        res.Path,
 			Caption:     caption,
@@ -450,10 +487,10 @@ func (b *Bot) allowed(userID int64) bool {
 	return len(b.cfg.AllowedUsers) == 0 || b.cfg.AllowedUsers[userID]
 }
 
-func (b *Bot) notify(chatID int64, text string, replyTo int64) {
+func (b *Bot) notify(chatID, threadID int64, text string, replyTo int64) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	if _, err := b.tg.SendMessage(ctx, chatID, text, replyTo); err != nil {
+	if _, err := b.tg.SendMessage(ctx, chatID, threadID, text, replyTo); err != nil {
 		log.Printf("sendMessage: %v", err)
 	}
 }
