@@ -25,6 +25,8 @@ type Bot struct {
 	jobs      chan job
 	userLocks *userLocks
 	wg        sync.WaitGroup
+
+	placeholderPath string
 }
 
 type job struct {
@@ -36,13 +38,19 @@ type job struct {
 }
 
 func NewBot(cfg *Config, tg *Client, dl *Downloader) *Bot {
-	return &Bot{
+	b := &Bot{
 		cfg:       cfg,
 		tg:        tg,
 		dl:        dl,
 		jobs:      make(chan job, jobQueueSize),
 		userLocks: newUserLocks(),
 	}
+	if path, err := writeStatusPlaceholder(cfg.WorkDir); err != nil {
+		log.Printf("не удалось создать картинку статуса: %v", err)
+	} else {
+		b.placeholderPath = path
+	}
+	return b
 }
 
 // Run запускает воркеров и long polling. Возвращается при отмене ctx.
@@ -283,12 +291,11 @@ func (b *Bot) processOne(j job, rawURL string) {
 	ctx, cancel := context.WithTimeout(context.Background(), b.cfg.JobTimeout)
 	defer cancel()
 
-	status, err := b.tg.SendMessage(ctx, j.chatID, j.threadID, "⏳ Скачиваю видео…", j.messageID)
+	st, err := b.startStatus(ctx, j)
 	if err != nil {
 		log.Printf("не удалось отправить статус: %v", err)
 		return
 	}
-	statusID := status.MessageID
 
 	progressCh := make(chan Progress, 1)
 	pdone := make(chan struct{})
@@ -296,7 +303,7 @@ func (b *Bot) processOne(j job, rawURL string) {
 	pw.Add(1)
 	go func() {
 		defer pw.Done()
-		b.progressLoop(ctx, j.chatID, statusID, progressCh, pdone)
+		b.progressLoop(ctx, st, progressCh, pdone)
 	}()
 
 	res, dlErr := b.dl.Download(ctx, rawURL, func(p Progress) {
@@ -310,21 +317,42 @@ func (b *Bot) processOne(j job, rawURL string) {
 
 	if dlErr != nil {
 		log.Printf("ошибка загрузки %s: %v", rawURL, dlErr)
-		b.reportFailure(ctx, j.chatID, statusID, dlErr)
+		b.reportFailure(ctx, st, dlErr)
 		return
 	}
 	defer res.Cleanup()
 
 	limitBytes := b.cfg.MaxUploadMB * 1024 * 1024
 	if res.Size > limitBytes {
-		b.edit(j.chatID, statusID, fmt.Sprintf("⚠️ Видео весит %s, а лимит отправки — %s.", humanSize(res.Size), humanSize(limitBytes)))
+		st.update(fmt.Sprintf("⚠️ Видео весит %s, а лимит отправки — %s.", humanSize(res.Size), humanSize(limitBytes)))
 		return
 	}
 
-	b.edit(j.chatID, statusID, "📤 Отправляю видео…")
+	st.update("📤 Отправляю видео…")
 
 	caption := b.caption(res)
 	useLocalRef := b.cfg.LocalAPI && res.Size > 50*1024*1024
+
+	// Основной путь: заменяем картинку статуса на видео в том же сообщении.
+	// Для больших файлов с локальным Bot API оставляем file://-отправку ниже.
+	if st.media && !useLocalRef {
+		sendCtx, sendCancel := context.WithTimeout(context.Background(), 15*time.Minute)
+		_, editErr := b.tg.EditMessageMedia(sendCtx, EditMedia{
+			ChatID:    j.chatID,
+			MessageID: st.messageID,
+			Path:      res.Path,
+			Caption:   caption,
+			Width:     res.Width,
+			Height:    res.Height,
+			Duration:  res.Duration,
+		})
+		sendCancel()
+		if editErr == nil {
+			log.Printf("отправлено (editMessageMedia) chat=%d url=%s размер=%s", j.chatID, rawURL, humanSize(res.Size))
+			return
+		}
+		log.Printf("editMessageMedia не удался (%v), отправляю видео отдельным сообщением", editErr)
+	}
 
 	_, err = b.tg.SendVideo(ctx, Video{
 		ChatID:      j.chatID,
@@ -352,19 +380,67 @@ func (b *Bot) processOne(j job, rawURL string) {
 		if docErr != nil {
 			log.Printf("sendDocument тоже не удался: %v", docErr)
 			if isTelegramTooBig(err) || isTelegramTooBig(docErr) {
-				b.edit(j.chatID, statusID, fmt.Sprintf("⚠️ Файл %s не принимается Telegram (лимит %s).\nУменьшите <code>MAX_UPLOAD_MB</code> или поднимите локальный Bot API.", humanSize(res.Size), humanSize(limitBytes)))
+				st.update(fmt.Sprintf("⚠️ Файл %s не принимается Telegram (лимит %s).\nУменьшите <code>MAX_UPLOAD_MB</code> или поднимите локальный Bot API.", humanSize(res.Size), humanSize(limitBytes)))
 				return
 			}
-			b.edit(j.chatID, statusID, "❌ Не удалось отправить файл в Telegram: "+html.EscapeString(truncate(docErr.Error(), 300)))
+			st.update("❌ Не удалось отправить файл в Telegram: " + html.EscapeString(truncate(docErr.Error(), 300)))
 			return
 		}
 	}
 
 	log.Printf("отправлено chat=%d url=%s размер=%s", j.chatID, rawURL, humanSize(res.Size))
-	b.edit(j.chatID, statusID, fmt.Sprintf("✅ Готово · %s", humanSize(res.Size)))
+	// Видео ушло отдельным сообщением — сообщение со статусом больше не нужно.
+	b.deleteStatus(st, fmt.Sprintf("✅ Готово · %s", humanSize(res.Size)))
 }
 
-func (b *Bot) progressLoop(ctx context.Context, chatID, messageID int64, ch <-chan Progress, done <-chan struct{}) {
+type statusMessage struct {
+	bot       *Bot
+	chatID    int64
+	messageID int64
+	media     bool
+}
+
+// startStatus отправляет сообщение с прогрессом: картинку (если удалось её
+// подготовить) или обычный текст.
+func (b *Bot) startStatus(ctx context.Context, j job) (*statusMessage, error) {
+	const initial = "⏳ Скачиваю видео…"
+	if b.placeholderPath != "" {
+		msg, err := b.tg.SendPhoto(ctx, j.chatID, j.threadID, b.placeholderPath, initial, j.messageID)
+		if err == nil {
+			return &statusMessage{bot: b, chatID: j.chatID, messageID: msg.MessageID, media: true}, nil
+		}
+		log.Printf("sendPhoto статуса не удался (%v), использую текст", err)
+	}
+	msg, err := b.tg.SendMessage(ctx, j.chatID, j.threadID, initial, j.messageID)
+	if err != nil {
+		return nil, err
+	}
+	return &statusMessage{bot: b, chatID: j.chatID, messageID: msg.MessageID}, nil
+}
+
+func (s *statusMessage) update(text string) {
+	if s == nil || s.bot == nil {
+		return
+	}
+	s.bot.editStatus(s.chatID, s.messageID, text, s.media)
+}
+
+// deleteStatus убирает сообщение со статусом, когда видео уже в чате.
+// Если удалить не удалось (нет прав, сообщение слишком старое), статус
+// переводится в fallback-текст, чтобы в чате не осталось «Отправляю видео…».
+func (b *Bot) deleteStatus(st *statusMessage, fallback string) {
+	if st == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := b.tg.DeleteMessage(ctx, st.chatID, st.messageID); err != nil {
+		log.Printf("deleteMessage статуса: %v", err)
+		st.update(fallback)
+	}
+}
+
+func (b *Bot) progressLoop(ctx context.Context, st *statusMessage, ch <-chan Progress, done <-chan struct{}) {
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 
@@ -377,7 +453,7 @@ func (b *Bot) progressLoop(ctx context.Context, chatID, messageID int64, ch <-ch
 			pending = true
 		case <-ticker.C:
 			if pending {
-				b.edit(chatID, messageID, progressText(last))
+				st.update(progressText(last))
 				pending = false
 			}
 		case <-done:
@@ -448,17 +524,17 @@ func progressText(p Progress) string {
 	return line
 }
 
-func (b *Bot) reportFailure(ctx context.Context, chatID, messageID int64, err error) {
+func (b *Bot) reportFailure(ctx context.Context, st *statusMessage, err error) {
 	if isTooBig(err) {
-		b.edit(chatID, messageID, fmt.Sprintf("⚠️ Видео слишком большое: даже минимальное качество не влезает в лимит %s.\n\nПопросите владельца бота увеличить <code>MAX_UPLOAD_MB</code> (для этого нужен локальный Bot API).", humanSize(b.cfg.MaxUploadMB*1024*1024)))
+		st.update(fmt.Sprintf("⚠️ Видео слишком большое: даже минимальное качество не влезает в лимит %s.\n\nПопросите владельца бота увеличить <code>MAX_UPLOAD_MB</code> (для этого нужен локальный Bot API).", humanSize(b.cfg.MaxUploadMB*1024*1024)))
 		return
 	}
 	if ctx.Err() == context.DeadlineExceeded {
-		b.edit(chatID, messageID, fmt.Sprintf("⏱ Превышено время ожидания (%s). Попробуйте ссылку на видео покороче.", b.cfg.JobTimeout))
+		st.update(fmt.Sprintf("⏱ Превышено время ожидания (%s). Попробуйте ссылку на видео покороче.", b.cfg.JobTimeout))
 		return
 	}
 	msg := cleanError(err.Error())
-	b.edit(chatID, messageID, "❌ Не удалось скачать видео.\n<code>"+html.EscapeString(truncate(msg, 600))+"</code>")
+	st.update("❌ Не удалось скачать видео.\n<code>" + html.EscapeString(truncate(msg, 600)) + "</code>")
 }
 
 func (b *Bot) caption(res *Result) string {
@@ -495,15 +571,21 @@ func (b *Bot) notify(chatID, threadID int64, text string, replyTo int64) {
 	}
 }
 
-func (b *Bot) edit(chatID, messageID int64, text string) {
+func (b *Bot) editStatus(chatID, messageID int64, text string, media bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	if err := b.tg.EditMessageText(ctx, chatID, messageID, text); err != nil {
+	var err error
+	if media {
+		err = b.tg.EditMessageCaption(ctx, chatID, messageID, text)
+	} else {
+		err = b.tg.EditMessageText(ctx, chatID, messageID, text)
+	}
+	if err != nil {
 		var apiErr *APIError
 		if errors.As(err, &apiErr) && strings.Contains(strings.ToLower(apiErr.Description), "not modified") {
 			return
 		}
-		log.Printf("editMessageText: %v", err)
+		log.Printf("правка статуса: %v", err)
 	}
 }
 

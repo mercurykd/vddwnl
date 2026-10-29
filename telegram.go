@@ -139,6 +139,86 @@ func (c *Client) EditMessageText(ctx context.Context, chatID, messageID int64, t
 	return c.callJSON(ctx, "editMessageText", payload, nil)
 }
 
+func (c *Client) SendPhoto(ctx context.Context, chatID, threadID int64, path, caption string, replyTo int64) (*Message, error) {
+	fields := map[string]string{
+		"chat_id":    strconv.FormatInt(chatID, 10),
+		"caption":    truncate(caption, 1024),
+		"parse_mode": "HTML",
+	}
+	if threadID != 0 {
+		fields["message_thread_id"] = strconv.FormatInt(threadID, 10)
+	}
+	if replyTo != 0 {
+		fields["reply_to_message_id"] = strconv.FormatInt(replyTo, 10)
+		fields["allow_sending_without_reply"] = "true"
+	}
+	var msg Message
+	if err := c.upload(ctx, "sendPhoto", fields, "photo", path, false, &msg); err != nil {
+		return nil, err
+	}
+	return &msg, nil
+}
+
+func (c *Client) EditMessageCaption(ctx context.Context, chatID, messageID int64, caption string) error {
+	payload := map[string]any{
+		"chat_id":    chatID,
+		"message_id": messageID,
+		"caption":    truncate(caption, 1024),
+		"parse_mode": "HTML",
+	}
+	return c.callJSON(ctx, "editMessageCaption", payload, nil)
+}
+
+func (c *Client) DeleteMessage(ctx context.Context, chatID, messageID int64) error {
+	payload := map[string]any{
+		"chat_id":    chatID,
+		"message_id": messageID,
+	}
+	return c.callJSON(ctx, "deleteMessage", payload, nil)
+}
+
+type EditMedia struct {
+	ChatID    int64
+	MessageID int64
+	Path      string
+	Caption   string
+	Width     int
+	Height    int
+	Duration  int
+}
+
+// EditMessageMedia заменяет картинку статуса на готовое видео, сохраняя сообщение.
+func (c *Client) EditMessageMedia(ctx context.Context, m EditMedia) (*Message, error) {
+	media := map[string]any{
+		"type":               "video",
+		"media":              "attach://video",
+		"caption":            truncate(m.Caption, 1024),
+		"parse_mode":         "HTML",
+		"supports_streaming": true,
+	}
+	if m.Width > 0 && m.Height > 0 {
+		media["width"] = m.Width
+		media["height"] = m.Height
+	}
+	if m.Duration > 0 {
+		media["duration"] = m.Duration
+	}
+	raw, err := json.Marshal(media)
+	if err != nil {
+		return nil, fmt.Errorf("editMessageMedia: %w", err)
+	}
+	fields := map[string]string{
+		"chat_id":    strconv.FormatInt(m.ChatID, 10),
+		"message_id": strconv.FormatInt(m.MessageID, 10),
+		"media":      string(raw),
+	}
+	var msg Message
+	if err := c.upload(ctx, "editMessageMedia", fields, "video", m.Path, false, &msg); err != nil {
+		return nil, err
+	}
+	return &msg, nil
+}
+
 type Video struct {
 	ChatID      int64
 	ThreadID    int64

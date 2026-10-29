@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -356,3 +357,84 @@ func TestCommandArg(t *testing.T) {
 		}
 	}
 }
+
+// TestDeleteStatusAfterSend проверяет, что после отдельной отправки видео
+// сообщение со статусом удаляется, а если Telegram удалять не даёт — статус
+// переводится в финальный текст, а не остаётся на «Отправляю видео…».
+func TestDeleteStatusAfterSend(t *testing.T) {
+	const finalText = "✅ Готово · 10.0 MiB"
+
+	tests := []struct {
+		name        string
+		media       bool
+		deleteFails bool
+		wantEdit    string // пусто — правки быть не должно
+	}{
+		{name: "статус удалён"},
+		{name: "фото-статус не удалился — правим подпись", media: true, deleteFails: true, wantEdit: "editMessageCaption"},
+		{name: "текстовый статус не удалился — правим текст", deleteFails: true, wantEdit: "editMessageText"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var (
+				mu      sync.Mutex
+				calls   []string
+				edited  string
+				editTxt string
+			)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				method := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
+				body, _ := io.ReadAll(r.Body)
+				var payload map[string]any
+				_ = json.Unmarshal(body, &payload)
+
+				mu.Lock()
+				calls = append(calls, method)
+				mu.Unlock()
+
+				w.Header().Set("Content-Type", "application/json")
+				switch {
+				case method == "deleteMessage" && tc.deleteFails:
+					io.WriteString(w, `{"ok":false,"error_code":400,"description":"message can't be deleted"}`)
+				case method == "editMessageText" || method == "editMessageCaption":
+					text, _ := payload["text"].(string)
+					if text == "" {
+						text, _ = payload["caption"].(string)
+					}
+					mu.Lock()
+					edited, editTxt = method, text
+					mu.Unlock()
+					io.WriteString(w, `{"ok":true,"result":{}}`)
+				default:
+					io.WriteString(w, `{"ok":true,"result":true}`)
+				}
+			}))
+			defer srv.Close()
+
+			b := &Bot{cfg: &Config{}, tg: NewClient("TOKEN", srv.URL)}
+			b.deleteStatus(&statusMessage{bot: b, chatID: -100200, messageID: 42, media: tc.media}, finalText)
+			// Отсутствие статуса не должно ломать отправку.
+			b.deleteStatus(nil, finalText)
+
+			mu.Lock()
+			defer mu.Unlock()
+			if len(calls) == 0 || calls[0] != "deleteMessage" {
+				t.Fatalf("статус должен удаляться первым вызовом, получено: %v", calls)
+			}
+			if tc.wantEdit == "" {
+				if len(calls) != 1 {
+					t.Fatalf("после успешного удаления лишние вызовы: %v", calls)
+				}
+				return
+			}
+			if edited != tc.wantEdit {
+				t.Fatalf("ожидалась правка через %s, вызовы: %v", tc.wantEdit, calls)
+			}
+			if !strings.Contains(editTxt, "Готово") {
+				t.Errorf("резервный текст статуса: %q", editTxt)
+			}
+		})
+	}
+}
+
